@@ -1,7 +1,7 @@
 # RCKangaroo 单机断点续算设计文档
 
-- 版本: v1.0 (设计稿)
-- 目标: 单机运行（无网络）时支持求解中断后从上次进度继续，不重做已完成的工作
+- 版本: v1.1 (设计稿)
+- 目标: 单机运行（无网络）时支持求解中断后从上次进度继续，不重做已完成的工作；通过任务映射表简化多谜题管理
 - 关联: 与 [distributed_design.md](distributed_design.md) 配套；server 落盘直接复用本文档的存档格式
 
 ---
@@ -10,7 +10,8 @@
 
 - 求解过程中（含任意时刻杀进程 / Ctrl+C / 断电）都能从最近一次保存的进度恢复，已收集的 DP 不丢失。
 - 恢复后正确性不变：继续走线的新 DP 与已存 DP 仍能正常碰撞求解。
-- 不加参数时保持现有行为完全不变（向后兼容）。
+- `-save` 默认开启（存档文件 `task.dat`），`-dp` 默认 16；通过 `-nosave` 可显式关闭断点续算回到旧行为。
+- 通过任务映射表（`tasks.txt`）用编号引用任务，无需每次输入长参数（`-range`/`-start`/`-pubkey`）。
 
 ### 非目标（v1 不做）
 
@@ -119,19 +120,90 @@ offset  size  字段                    说明
 
 ## 5. 命令行设计
 
-```
-# 启用断点续算（.dat 不存在则新建；存在则校验并恢复）
-RCKangaroo.exe -save mytask.dat -dp 16 -range 84 -start ... -pubkey ...
+### 5.0 参数默认值
 
-# 可选控制
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `-save` | `task.dat`（自动开启） | 断点续算存档文件名；设为空或 `-nosave` 关闭 |
+| `-dp` | `16` | 跳跃表位数（DP 参数） |
+| `-taskfile` | `tasks.txt` | 任务映射表文件路径 |
+
+**核心设计原则**：最小化日常输入。用户只需 `-task <编号>` 即可启动求解，其余参数从映射表读取。
+
+### 5.1 任务映射表
+
+**目的**：BTC 谜题涉及多个不同 range/start/pubkey 的任务，手动输入这些长十六进制字符串容易出错且不便管理。任务映射表将每个任务（range + start + pubkey）绑定到一个编号，实现"一次配置、多次引用"，同时方便在多任务间切换求解。
+
+**文件格式**（纯文本，默认 `tasks.txt`）：
+
+```
+# BTC 谜题任务映射表
+# 格式: <id> <range> <start_hex> <pubkey_hex>
+# # 开头的行为注释，空行跳过
+# 同一 id 出现多次时，最后一次生效（允许覆盖）
+
+1  84  0000000000000000000000000000000000000000000000000000000000000001  04...
+2  88  0000000000000000000000000000000000000000000000000000000000000002  04...
+3  84  0000000000000000000000000000000000000000000000000000000000000003  04...
+```
+
+**解析规则**：
+- 每行 4 个字段（以空白分隔）：`id`（正整数）、`range`（整数）、`start_hex`（64 字符十六进制）、`pubkey_hex`（130 字符十六进制，含 04 前缀）
+- 以 `#` 开头的行为注释，跳过；空行跳过
+- 字段数不足 4 的行 → 警告并跳过
+- `id` 非正整数 → 警告并跳过
+- `range` 不在合法范围（如 32~256）→ 警告并跳过
+- 同一 `id` 重复定义 → 最后一次覆盖，输出警告
+
+**校验**：启动时若指定 `-task`，程序读取映射表并校验对应条目的 start/pubkey 格式。若映射表不存在或指定 id 未找到，报错退出。
+
+### 5.2 命令行用法
+
+```
+# === 最简用法：按任务编号求解（-save 和 -dp 均取默认值）===
+RCKangaroo.exe -task 1
+
+# === 等价于 ===
+RCKangaroo.exe -save task.dat -dp 16 -task 1
+
+# === 指定任务编号 + 自定义存档名 ===
+RCKangaroo.exe -task 1 -save puzzle84.dat
+
+# === 显式指定全部参数（不使用映射表）===
+RCKangaroo.exe -save task.dat -dp 16 -range 84 -start ... -pubkey ...
+
+# === 关闭断点续算（回到旧行为）===
+RCKangaroo.exe -nosave -dp 16 -range 84 -start ... -pubkey ...
+
+# === 使用自定义映射表文件 ===
+RCKangaroo.exe -task 1 -taskfile my_tasks.txt
+
+# === 可选控制参数 ===
 -save_sec <n>         日志 flush 间隔，默认 60 秒
 -checkpoint_sec <n>   全量 checkpoint 间隔，默认 1800 秒
 ```
 
-- 指定 `-save` 时，`-tames` 变为可选（checkpoint 已含 tames DP）。
-- 不指定 `-save` → 行为与现在完全一致。
+### 5.3 参数解析优先级
 
-### 5.1 求解进度显示方案
+任务参数（`range`/`start`/`pubkey`）的确定顺序：
+
+1. 若同时指定 `-task` 和显式 `-range`/`-start`/`-pubkey`，**显式参数优先**（覆盖映射表，方便临时调参）
+2. 若仅指定 `-task`，从映射表读取全部三个参数
+3. 若仅指定显式参数，与现有行为一致
+4. 若既无 `-task` 也无显式参数（且非 `-tames` 生成模式），报错退出
+
+**存档与任务绑定**：`-save` 的 `.dat` 文件与任务参数（range/dp/start/pubkey）绑定（见 §4.1 元数据校验）。同一任务多次求解自动复用同一存档；不同任务使用不同存档文件名以避免校验冲突。建议用法：每个任务绑定一个存档名，例如 `-task 1 -save task1.dat`、`-task 2 -save task2.dat`，或直接使用默认 `task.dat`（每次切换任务时自动校验，不匹配则报错而非覆盖）。
+
+### 5.4 端口预留
+
+可在映射表中预留端口号字段（v1 不做，为分布式扩展预留）：
+
+```
+# 扩展格式（v2）: <id> <range> <start_hex> <pubkey_hex> [port]
+1  84  000...001  04...  [5000]
+```
+
+### 5.5 求解进度显示方案
 
 **现状**：现有 [ShowStats](RCKangaroo.cpp#L291-L324) 每 10s 输出 `Speed / Err / DPs: 已收集K/预期K / Time: 已耗时/预期总耗时`，已有基础进度信息，但缺失：进度百分比、剩余时间（当前显示的是总预期耗时而非 ETA）、实时 K；且断点续算场景下已耗时从进程启动计（重启清零）、预期值不扣除已完成工作量（失真）。
 
@@ -151,19 +223,20 @@ MAIN: [#############-----] 73.4% | Speed: 14500 MKeys/s | K: 1.18 | DPs: 56600K/
 
 **GEN 模式（tames 生成）**：预算口径 `Progress = PntTotalOps / MaxTotalOps`（`-max` 即本次生成预算），其余字段同。
 
-**恢复场景启动信息**：`Resumed: X DPs (Y% progress), ops_done=Z, elapsed=D`，`Y` 用 §4.1 存档中已收集 DP 数 / 预期 DP 数估算（复用 [RCKangaroo.cpp:339-358](RCKangaroo.cpp#L339-L358) 的公式）。
+**恢复场景启动信息**：`Resumed: X DPs (Y% progress), ops_done=Z, elapsed=D`，`Y` 用 §4.1 存档中已收集 DP 数 / 预期 DP 数估算（复用 [RCKangaroo.cpp:339-358](RCKangaroo.cpp#L339-L358) 的公式）。若使用任务映射表，启动时额外输出 `Task #N: range=R, start=...` 确认当前任务。
 
 **数据来源与改动**：
 - 新增全局 `gOpsDone`、`gTaskStartTime`：恢复时从存档 Header 读入；旧存档（无 `task_start_time`）取当前时间，即"从本次运行起算"（`ops_done` 仍正确恢复）
 - `ShowStats` 增加上述字段输出；保留 `tm_start` 参数供 GEN/bench 模式使用
 - 全部运算走 `double`，仅最后格式化时取整
+- 任务映射表解析：新增 `LoadTaskMapping()` 函数，返回 `std::map<int, TaskMeta>`（见 §6.2.0）
 
 **边界情况**：
 - 恢复后前几秒 `speed` 未测得（`GetStatsSpeed` 返回 0）→ ETA 显示 `--`，进度百分比不受影响（只依赖 `PntTotalOps`）
 - `-max` 触发停止前进度显示到 100% 或按 `-max` 口径显示
 - 求解成功即刻退出，不再多刷一行
 
-### 5.2 tames 预生成与断点续算的组合
+### 5.6 tames 预生成与断点续算的组合
 
 **结论：方案完全保留"预生成 tames → 再求解"的工作流**。tames 预生成继续使用现有 `-tames` 机制（不变），`-save` 只承载求解阶段的断点。
 
@@ -174,10 +247,10 @@ MAIN: [#############-----] 73.4% | Speed: 14500 MKeys/s | K: 1.18 | DPs: 56600K/
 RCKangaroo.exe -dp 16 -range 84 -tames tames84.dat -max 10
 
 # 2) 首次求解（.dat 不存在 → 走现有 -tames 加载路径初始化 DB）
-RCKangaroo.exe -save task.dat -tames tames84.dat -dp 16 -range 84 -start ... -pubkey ...
+RCKangaroo.exe -task 1 -tames tames84.dat
 
 # 3) 断点恢复（.dat 已含 tames + wild，-tames 可省略）
-RCKangaroo.exe -save task.dat -dp 16 -range 84 -start ... -pubkey ...
+RCKangaroo.exe -task 1
 ```
 
 **组合规则**：
@@ -186,7 +259,7 @@ RCKangaroo.exe -save task.dat -dp 16 -range 84 -start ... -pubkey ...
 - 同一 range 换目标 key、复用同一批 tames：`.dat` 与 pubkey 绑定（§4.1 校验会拒绝复用），需换新的 `-save` 文件名，并继续指定 `-tames tames84.dat`。
 - GEN 存档（mode=1）与 solve 存档（mode=0）互不混用（§4.1 mode 校验拒绝）；tames 预生成始终使用 `-tames` 机制，`-save` 支持 GEN 模式断点留作 v2 增强。
 
-**正确性说明**：tames 与目标 key 无关（只依赖 range 与固定跳表种子 [RCKangaroo.cpp:388](RCKangaroo.cpp#L388)），可跨多次求解复用；`.dat` 中的 wild DP 与目标 key 相关，故存档与 pubkey 绑定。预生成 tames 的运算量（GEN 运行）不计入 solve 的 `PntTotalOps`，因此通过 `-tames` 预加载大量 tame DP 时，`DPs: 已收集/预期` 口径比 ops 口径的 `Progress%` 更贴近真实进度（§5.1 的 ops 进度从 0 起算）。
+**正确性说明**：tames 与目标 key 无关（只依赖 range 与固定跳表种子 [RCKangaroo.cpp:388](RCKangaroo.cpp#L388)），可跨多次求解复用；`.dat` 中的 wild DP 与目标 key 相关，故存档与 pubkey 绑定。预生成 tames 的运算量（GEN 运行）不计入 solve 的 `PntTotalOps`，因此通过 `-tames` 预加载大量 tame DP 时，`DPs: 已收集/预期` 口径比 ops 口径的 `Progress%` 更贴近真实进度（§5.5 的 ops 进度从 0 起算）。
 
 ---
 
@@ -200,16 +273,25 @@ RCKangaroo.exe -save task.dat -dp 16 -range 84 -start ... -pubkey ...
 
 ### 6.2 `RCKangaroo.cpp` — 求解流程
 
+0. **任务映射表解析**（新增，在参数解析阶段）：
+   - 新增 `TaskMeta` 结构体：`{ int range; char start_hex[64]; char pubkey_hex[130]; }`
+   - 新增 `LoadTaskMapping(const char* fn)`：逐行解析 `tasks.txt`，返回 `std::map<int, TaskMeta>`
+   - 新增 `-task <id>` 参数：从映射表查找对应条目，填充 `range`/`start`/`pubkey`
+   - 新增 `-taskfile <path>` 参数：指定映射表路径（默认 `tasks.txt`）
+   - 新增 `-nosave` 参数：显式关闭断点续算
+   - 参数解析优先级：显式 `-range`/`-start`/`-pubkey` > `-task` 映射表 > 报错（见 §5.3）
+   - 加载成功时输出 `Task #N: range=R, start=...` 确认
 1. **恢复加载**：把 [RCKangaroo.cpp:372-386](RCKangaroo.cpp#L372-L386) 的 tames 加载块泛化为：
-   - `-save` 且 `.dat` 存在 → 校验元数据 → `db.LoadFromFile(.dat)` → 回放 `.log` → `PntTotalOps = ops_done`（此时若同时指定 `-tames` 则忽略，规则见 §5.2）；
+   - `-save` 且 `.dat` 存在 → 校验元数据 → `db.LoadFromFile(.dat)` → 回放 `.log` → `PntTotalOps = ops_done`（此时若同时指定 `-tames` 则忽略，规则见 §5.6）；
    - 否则走现有 `-tames` 逻辑（不变）。
+   - `-save` 默认值为 `task.dat`（若未指定 `-nosave` 且未显式指定 `-save`）。
 2. **日志挂钩**：`CheckNewPoints` 内新入库处追加到内存 journal 缓冲（互斥锁保护，容量上限如 64 MB，满则强制 flush）。
 3. **主循环定时钩子**（[RCKangaroo.cpp:464-480](RCKangaroo.cpp#L464-L480)）：
    - 到 `save_sec` → flush journal 缓冲到 `.log`；
    - 到 `checkpoint_sec` 或 journal 累计超阈值（如 1 GB）→ 全量 `.tmp`→rename→截断 `.log`。
 4. **优雅退出**：新增 `gExitRequested` 标志；Windows 用 `SetConsoleCtrlHandler`（回调只置标志），Linux 用 `signal(SIGINT)`；主循环检测到后走现有"停止 GPU → join 线程"路径（[RCKangaroo.cpp:482-494](RCKangaroo.cpp#L482-L494)），随后 flush + 全量 checkpoint 再返回。
 5. **`-max` 语义**：上限判断改为 `(PntTotalOps - ops_done) > MaxTotalOps`（恢复后预算从零重新计，历史 ops 只用于统计与 K 显示），`ops_done` 在恢复时保存、在结束时更新到存档。
-6. **进度显示**：按 §5.1 改造 [ShowStats](RCKangaroo.cpp#L291-L324)——
+6. **进度显示**：按 §5.5 改造 [ShowStats](RCKangaroo.cpp#L291-L324)——
    - 新增全局 `gOpsDone`、`gTaskStartTime`（恢复时从存档 Header 读入，旧存档缺省取当前时间）；
    - 输出进度百分比、实时 K、连续 elapsed、剩余 ETA；`tm_start` 参数保留给 GEN/bench 模式。
 7. **成功清理**：`gSolved` 分支删除 `.dat/.log`。
@@ -217,6 +299,8 @@ RCKangaroo.exe -save task.dat -dp 16 -range 84 -start ... -pubkey ...
 ### 6.3 `defs.h` — 常量
 
 - journal 缓冲大小、flush/checkpoint 默认间隔、日志记录长度（35）等宏。
+- 新增 `DEFAULT_DP 16`、`DEFAULT_SAVE_FILE "task.dat"`、`DEFAULT_TASK_FILE "tasks.txt"`。
+- 新增 `MAX_TASK_LINE 512`（映射表单行最大长度）。
 
 ### 6.4 构建
 
@@ -266,6 +350,8 @@ RCKangaroo.exe -save task.dat -dp 16 -range 84 -start ... -pubkey ...
 4. **journal 与 .dat 不一致**：仅可能由磁盘故障导致；v1 不做 checksum（SSD 时代概率低），v2 可加。
 5. **长时间运行磁盘写放大**：journal 阈值 + checkpoint 间隔可配置；对 SSD 寿命无实质影响。
 6. **`-max` 预算语义变化**：恢复后重新计预算（§6.2.5），文档中明示，避免用户误解。
+7. **任务映射表被误改/删除**：映射表缺失或指定 id 不存在 → 报错退出，绝不静默降级；映射表内容被篡改导致 range/start/pubkey 错误 → 元数据校验（§4.1）会在存档加载时捕获（若为首次求解则无存档可校验，依赖用户正确配置）。
+8. **`-task` 与显式参数冲突**：按 §5.3 优先级，显式参数覆盖映射表，同时输出警告提示用户确认意图。
 
 ---
 
@@ -273,9 +359,9 @@ RCKangaroo.exe -save task.dat -dp 16 -range 84 -start ... -pubkey ...
 
 | 阶段 | 内容 | 验收 |
 |---|---|---|
-| M1 | Header 元数据扩展 + LoadFromFile 兼容旧 tames + ValidateMeta | 用现有 tames 文件加载无回归；构造不同元数据存档能正确拒绝 |
+| M1 | Header 元数据扩展 + LoadFromFile 兼容旧 tames + ValidateMeta + 任务映射表解析（`LoadTaskMapping`） | 用现有 tames 文件加载无回归；构造不同元数据存档能正确拒绝；`tasks.txt` 多条目解析正确，非法行跳过并告警 |
 | M2 | journal 追加/回放/尾部截断容错 | 构造 10 万条合成记录，模拟半截文件，回放结果与逐条插入一致 |
-| M3 | 主循环钩子 + Ctrl+C 优雅退出 + `-max` 语义 + 进度显示（§5.1） | 32-bit 随机点求解中 Ctrl+C → 重启 `-save` 续算解出；结果与单次连续求解一致；重启后 Progress/Elapsed/ETA 与中断前连续衔接 |
+| M3 | 主循环钩子 + Ctrl+C 优雅退出 + `-max` 语义 + 进度显示（§5.5）+ `-task`/`-nosave` 参数解析 | 32-bit 随机点求解中 Ctrl+C → 重启 `-task N` 续算解出；结果与单次连续求解一致；重启后 Progress/Elapsed/ETA 与中断前连续衔接；`-nosave` 关闭断点续算后行为与旧版一致 |
 | M4 | checkpoint 周期落盘 + 恢复进度显示 + 调优 | 84 位以下长时间求解：中途杀进程重启续算，K 与未中断相比偏差 < 3% |
 
 ---
@@ -284,8 +370,9 @@ RCKangaroo.exe -save task.dat -dp 16 -range 84 -start ... -pubkey ...
 
 **修改**
 - `utils.h/.cpp` — Header 元数据读写、校验函数、journal 追加/回放接口
-- `RCKangaroo.cpp` — 恢复加载块、CheckNewPoints 日志挂钩、主循环定时钩子、信号处理、`-max` 语义、`-save` 参数解析、ShowStats 进度显示改造（§5.1）
-- `defs.h` — 相关常量宏
+- `RCKangaroo.cpp` — 任务映射表解析（`LoadTaskMapping`）、`-task`/`-taskfile`/`-nosave` 参数解析、恢复加载块、CheckNewPoints 日志挂钩、主循环定时钩子、信号处理、`-max` 语义、`-save` 默认值、ShowStats 进度显示改造（§5.5）
+- `defs.h` — 相关常量宏（`DEFAULT_DP`、`DEFAULT_SAVE_FILE`、`DEFAULT_TASK_FILE`、`MAX_TASK_LINE` 等）
 
 **新增（可选，视实现习惯）**
 - `Checkpoint.h/.cpp` — 封装 journal 缓冲、flush/checkpoint 调度，避免 RCKangaroo.cpp 膨胀
+- `tasks.txt` — 任务映射表示例文件（随源码分发，含注释说明格式）
