@@ -51,6 +51,17 @@ typedef char i8;
 
 //#define DEBUG_MODE
 
+// --- Checkpoint / Journal constants ---
+#define JOURNAL_REC_LEN			35		// x[12] + d[22] + type[1]
+#define JOURNAL_BUF_SIZE		(64 * 1024 * 1024)	// 64 MB journal buffer
+#define JOURNAL_MAX_SIZE		(1024 * 1024 * 1024)	// 1 GB threshold to trigger full checkpoint
+#define DEFAULT_SAVE_SEC		60		// journal flush interval (seconds)
+#define DEFAULT_CHECKPOINT_SEC	1800	// full checkpoint interval (seconds)
+#define DEFAULT_DP				16
+#define DEFAULT_SAVE_FILE		"task.dat"
+#define DEFAULT_TASK_FILE		"tasks.txt"
+#define MAX_TASK_LINE			512		// max line length in tasks.txt
+
 //gpu kernel parameters
 struct TKparams
 {

@@ -6,6 +6,8 @@
 
 #include <iostream>
 #include <vector>
+#include <csignal>
+#include <cstdarg>
 
 #include "cuda_runtime.h"
 #include "cuda.h"
@@ -56,6 +58,40 @@ double gMax;
 bool gGenMode; //tames generation mode
 bool gIsOpsLimit;
 
+// --- Checkpoint / Journal globals ---
+char gSaveFileName[1024];     // -save filename (default "task.dat")
+char gTaskFileName[1024];     // -taskfile filename (default "tasks.txt")
+int  gTaskId;                 // -task <id> (0 = not specified)
+bool gNoSave;                 // -nosave flag
+int  gSaveSec;                // journal flush interval (seconds)
+int  gCheckpointSec;          // full checkpoint interval (seconds)
+u64  gOpsDone;                // ops_done from checkpoint restore
+u64  gTaskStartTime;          // task start time (preserved across restarts)
+volatile bool gExitRequested; // Ctrl+C / SIGINT flag
+
+// Journal buffer (in-memory WAL)
+u8*  gJournalBuf;             // circular buffer for journal records
+volatile int gJournalBufCnt;  // number of records in buffer
+u64  gLastFlushTime;          // last journal flush timestamp
+u64  gLastCheckpointTime;     // last full checkpoint timestamp
+CriticalSection csJournal;    // lock for journal buffer access
+
+// ============================================================================
+// Simple timestamped logger (printf-based, no external dependency)
+// ============================================================================
+static void LogMsg(const char* level, const char* fmt, ...)
+{
+	u64 t = GetTickCount64();
+	u64 sec = t / 1000;
+	u64 ms = t % 1000;
+	printf("[%s] %llu.%03llu ", level, sec, ms);
+	va_list args;
+	va_start(args, fmt);
+	vprintf(fmt, args);
+	va_end(args);
+	printf("\r\n");
+}
+
 #pragma pack(push, 1)
 struct DBRec
 {
@@ -64,6 +100,131 @@ struct DBRec
 	u8 type; //0 - tame, 1 - wild1, 2 - wild2
 };
 #pragma pack(pop)
+
+// ============================================================================
+// Signal handler for graceful shutdown (Ctrl+C / SIGINT)
+// ============================================================================
+#ifdef _WIN32
+BOOL WINAPI ConsoleCtrlHandler(DWORD dwCtrlType)
+{
+	const char* reason = "unknown";
+	switch (dwCtrlType)
+	{
+	case CTRL_C_EVENT:       reason = "CTRL_C"; break;
+	case CTRL_BREAK_EVENT:   reason = "CTRL_BREAK"; break;
+	case CTRL_CLOSE_EVENT:   reason = "CTRL_CLOSE"; break;
+	case CTRL_LOGOFF_EVENT:  reason = "CTRL_LOGOFF"; break;
+	case CTRL_SHUTDOWN_EVENT:reason = "CTRL_SHUTDOWN"; break;
+	}
+	if (dwCtrlType == CTRL_C_EVENT || dwCtrlType == CTRL_BREAK_EVENT ||
+		dwCtrlType == CTRL_CLOSE_EVENT || dwCtrlType == CTRL_LOGOFF_EVENT ||
+		dwCtrlType == CTRL_SHUTDOWN_EVENT)
+	{
+		LogMsg("SIGNAL", "ConsoleCtrlHandler: %s received, setting gExitRequested=true", reason);
+		gExitRequested = true;
+		return TRUE; // handled
+	}
+	return FALSE;
+}
+#else
+void SigIntHandler(int signum)
+{
+	LogMsg("SIGNAL", "SigIntHandler: signal=%d (%s), setting gExitRequested=true",
+		signum, signum == SIGINT ? "SIGINT" : signum == SIGTERM ? "SIGTERM" : "?");
+	gExitRequested = true;
+}
+#endif
+
+// ============================================================================
+// Checkpoint helper: flush journal buffer to .log file
+// ============================================================================
+void FlushJournal()
+{
+	if (gNoSave || !gSaveFileName[0]) return;
+	if (gJournalBufCnt <= 0) return;
+
+	csJournal.Enter();
+	int cnt = gJournalBufCnt;
+	gJournalBufCnt = 0;
+	csJournal.Leave();
+
+	if (cnt <= 0) return;
+
+	char log_fn[1024];
+	MakeJournalName(gSaveFileName, log_fn, sizeof(log_fn));
+	LogMsg("JOURNAL", "FlushJournal: flushing %d records (%d bytes) to %s",
+		cnt, cnt * JOURNAL_REC_LEN, log_fn);
+	bool ok = AppendJournalFile(log_fn, gJournalBuf, cnt);
+	if (ok)
+		LogMsg("JOURNAL", "FlushJournal: OK — %d records written to %s", cnt, log_fn);
+	else
+		LogMsg("JOURNAL", "FlushJournal: FAILED to write %d records to %s!", cnt, log_fn);
+}
+
+// ============================================================================
+// Checkpoint helper: full checkpoint (DB -> .tmp -> rename -> truncate .log)
+// ============================================================================
+void DoFullCheckpoint()
+{
+	if (gNoSave || !gSaveFileName[0]) return;
+
+	LogMsg("CHECKPOINT", "DoFullCheckpoint: starting — DB blocks=%llu, PntTotalOps=%llu",
+		db.GetBlockCnt(), PntTotalOps);
+
+	// First flush any pending journal
+	FlushJournal();
+
+	char tmp_fn[1024], log_fn[1024];
+	MakeTmpName(gSaveFileName, tmp_fn, sizeof(tmp_fn));
+	MakeJournalName(gSaveFileName, log_fn, sizeof(log_fn));
+
+	// Get start/pk hex strings for metadata
+	char start_hex[44] = { 0 };
+	char pubkey_hex[112] = { 0 };
+	if (gStartSet)
+		gStart.GetHexStr(start_hex);
+	if (!gPubKey.x.IsZero())
+	{
+		char sx[100], sy[100];
+		gPubKey.x.GetHexStr(sx);
+		gPubKey.y.GetHexStr(sy);
+		snprintf(pubkey_hex, sizeof(pubkey_hex), "%s%s", sx, sy);
+	}
+
+	int mode = gGenMode ? HEADER_MODE_GEN : HEADER_MODE_SOLVE;
+	u64 cur_ops = PntTotalOps;
+	u64 task_start = gTaskStartTime ? gTaskStartTime : GetTickCount64();
+
+	double db_gb = (double)db.GetBlockCnt() * 32 / (1024 * 1024 * 1024);
+	LogMsg("CHECKPOINT", "DoFullCheckpoint: writing DB (%.1f GB) to tmp=%s, mode=%d, range=%d, dp=%d",
+		db_gb, tmp_fn, mode, gRange, gDP);
+
+	if (db.SaveToFileEx(tmp_fn, gRange, gDP, mode, start_hex, pubkey_hex, cur_ops, task_start))
+	{
+		LogMsg("CHECKPOINT", "DoFullCheckpoint: SaveToFileEx OK (%.1f GB), renaming %s -> %s",
+			db_gb, tmp_fn, gSaveFileName);
+		// Atomic rename
+		if (rename(tmp_fn, gSaveFileName) == 0)
+		{
+			// Truncate journal
+			FILE* fp = fopen(log_fn, "wb");
+			if (fp) { fclose(fp); LogMsg("CHECKPOINT", "DoFullCheckpoint: journal %s truncated", log_fn); }
+			else      LogMsg("CHECKPOINT", "DoFullCheckpoint: WARNING — cannot truncate journal %s", log_fn);
+			gLastCheckpointTime = GetTickCount64();
+			LogMsg("CHECKPOINT", "DoFullCheckpoint: COMPLETE — %llu DPs saved to %s, next checkpoint in %ds",
+				db.GetBlockCnt(), gSaveFileName, gCheckpointSec);
+		}
+		else
+		{
+			LogMsg("CHECKPOINT", "DoFullCheckpoint: FAILED — rename(%s, %s) error, tmp file left on disk",
+				tmp_fn, gSaveFileName);
+		}
+	}
+	else
+	{
+		LogMsg("CHECKPOINT", "DoFullCheckpoint: FAILED — SaveToFileEx(%s) returned false", tmp_fn);
+	}
+}
 
 void InitGpus()
 {
@@ -224,17 +385,38 @@ void CheckNewPoints()
 	csAddPoints.Leave();
 
 	for (int i = 0; i < cnt; i++)
-	{
-		DBRec nrec;
-		u8* p = pPntList2 + i * GPU_DP_SIZE;
-		memcpy(nrec.x, p, 12);
-		memcpy(nrec.d, p + 16, 22);
-		nrec.type = gGenMode ? TAME : p[40];
+		{
+			DBRec nrec;
+			u8* p = pPntList2 + i * GPU_DP_SIZE;
+			memcpy(nrec.x, p, 12);
+			memcpy(nrec.d, p + 16, 22);
+			nrec.type = gGenMode ? TAME : p[40];
 
-		DBRec* pref = (DBRec*)db.FindOrAddDataBlock((u8*)&nrec);
-		if (gGenMode)
-			continue;
-		if (pref)
+			DBRec* pref = (DBRec*)db.FindOrAddDataBlock((u8*)&nrec);
+			if (gGenMode)
+				continue;
+
+			// Journal: if new DP was actually added (pref == NULL), append to journal buffer
+				if (!pref && !gNoSave && gSaveFileName[0])
+				{
+					csJournal.Enter();
+					int buf_idx = gJournalBufCnt;
+					if (buf_idx < JOURNAL_BUF_SIZE / JOURNAL_REC_LEN)
+					{
+						memcpy(gJournalBuf + buf_idx * JOURNAL_REC_LEN, &nrec, JOURNAL_REC_LEN);
+						gJournalBufCnt = buf_idx + 1;
+					}
+					csJournal.Leave();
+					// If buffer is full, force flush (should not happen under normal operation)
+					if (buf_idx >= JOURNAL_BUF_SIZE / JOURNAL_REC_LEN - 1)
+					{
+						LogMsg("JOURNAL", "CheckNewPoints: buffer FULL (%d/%d records), force flush",
+							buf_idx + 1, (int)(JOURNAL_BUF_SIZE / JOURNAL_REC_LEN));
+						FlushJournal();
+					}
+				}
+
+			if (pref)
 		{
 			//in db we dont store first 3 bytes so restore them
 			DBRec tmp_pref;
@@ -308,19 +490,48 @@ void ShowStats(u64 tm_start, double exp_ops, double dp_val)
 		speed += GpuKangs[i]->GetStatsSpeed();
 
 	u64 est_dps_cnt = (u64)(exp_ops / dp_val);
-	u64 exp_sec = 0xFFFFFFFFFFFFFFFFull;
-	if (speed)
-		exp_sec = (u64)((exp_ops / 1000000) / speed); //in sec
-	u64 exp_days = exp_sec / (3600 * 24);
-	int exp_hours = (int)(exp_sec - exp_days * (3600 * 24)) / 3600;
-	int exp_min = (int)(exp_sec - exp_days * (3600 * 24) - exp_hours * 3600) / 60;
+	u64 cur_dps = db.GetBlockCnt();
 
-	u64 sec = (GetTickCount64() - tm_start) / 1000;
-	u64 days = sec / (3600 * 24);
-	int hours = (int)(sec - days * (3600 * 24)) / 3600;
-	int min = (int)(sec - days * (3600 * 24) - hours * 3600) / 60;
-	 
-	printf("%sSpeed: %d MKeys/s, Err: %d, DPs: %lluK/%lluK, Time: %llud:%02dh:%02dm/%llud:%02dh:%02dm\r\n", gGenMode ? "GEN: " : (IsBench ? "BENCH: " : "MAIN: "), speed, gTotalErrors, db.GetBlockCnt()/1000, est_dps_cnt/1000, days, hours, min, exp_days, exp_hours, exp_min);
+	// Progress percentage (ops-based)
+	double progress = 0.0;
+	if (exp_ops > 0)
+		progress = (double)100.0 * (double)PntTotalOps / exp_ops;
+	if (progress > 100.0) progress = 100.0;
+
+	// Real-time K
+	double K_val = (double)PntTotalOps / pow(2.0, gRange / 2.0);
+
+	// Elapsed time (cross-restart continuous)
+	u64 elapsed_ms = GetTickCount64() - gTaskStartTime;
+	u64 elapsed_sec = gTaskStartTime ? (elapsed_ms / 1000) : ((GetTickCount64() - tm_start) / 1000);
+	int elap_d = (int)(elapsed_sec / 86400);
+	int elap_h = (int)((elapsed_sec % 86400) / 3600);
+	int elap_m = (int)((elapsed_sec % 3600) / 60);
+
+	// ETA (subtract already completed ops)
+	u64 eta_sec = 0xFFFFFFFFFFFFFFFFull;
+	if (speed > 0 && PntTotalOps < (u64)exp_ops)
+		eta_sec = (u64)((exp_ops - (double)PntTotalOps) / 1000000.0 / (double)speed);
+	int eta_d = (int)(eta_sec / 86400);
+	int eta_h = (int)((eta_sec % 86400) / 3600);
+	int eta_m = (int)((eta_sec % 3600) / 60);
+
+	// Build progress bar (20 chars)
+	char bar[21] = "[                    ]";
+	int bar_fill = (int)(progress / 5.0);
+	if (bar_fill > 20) bar_fill = 20;
+	for (int b = 0; b < bar_fill; b++) bar[b + 1] = '#';
+
+	const char* prefix = gGenMode ? "GEN: " : (IsBench ? "BENCH: " : "MAIN: ");
+
+	if (eta_sec == 0xFFFFFFFFFFFFFFFFull)
+		printf("%s%s %.1f%% | Speed: %d MKeys/s | K: %.2f | DPs: %lluK/%lluK | Elapsed: %dd:%02dh:%02dm | ETA: --\r\n",
+			prefix, bar, progress, speed, K_val, cur_dps / 1000, est_dps_cnt / 1000,
+			elap_d, elap_h, elap_m);
+	else
+		printf("%s%s %.1f%% | Speed: %d MKeys/s | K: %.2f | DPs: %lluK/%lluK | Elapsed: %dd:%02dh:%02dm | ETA: %dd:%02dh:%02dm\r\n",
+			prefix, bar, progress, speed, K_val, cur_dps / 1000, est_dps_cnt / 1000,
+			elap_d, elap_h, elap_m, eta_d, eta_h, eta_m);
 }
 
 bool SolvePoint(EcPoint PntToSolve, int Range, int DP, EcInt* pk_res)
@@ -367,9 +578,97 @@ bool SolvePoint(EcPoint PntToSolve, int Range, int DP, EcInt* pk_res)
 		printf("Max allowed number of ops: 2^%.3f, max RAM for DPs: %.3f GB\r\n", log2(MaxTotalOps), ram_max);
 	}
 
+	// ======================================================================
+	// Checkpoint recovery: load .dat + replay .log
+	// ======================================================================
+	bool checkpoint_loaded = false;
+	if (!gNoSave && gSaveFileName[0] && IsFileExist(gSaveFileName))
+	{
+		LogMsg("RECOVER", "Checkpoint file found: %s, attempting load...", gSaveFileName);
+		if (db.LoadFromFile(gSaveFileName))
+		{
+			LogMsg("RECOVER", "LoadFromFile OK: %s loaded, %llu DPs, header[0]=%d, format_ver=%d",
+				gSaveFileName, db.GetBlockCnt(), db.Header[HDR_OFF_RANGE], db.Header[HDR_OFF_FORMAT_VER]);
 
+			// Get hex strings for validation
+			char start_hex[44] = { 0 };
+			char pubkey_hex[112] = { 0 };
+			if (gStartSet)
+				gStart.GetHexStr(start_hex);
+			if (!gPubKey.x.IsZero())
+			{
+				char sx[100], sy[100];
+				gPubKey.x.GetHexStr(sx);
+				gPubKey.y.GetHexStr(sy);
+				snprintf(pubkey_hex, sizeof(pubkey_hex), "%s%s", sx, sy);
+			}
 
-	if (!gGenMode && gTamesFileName[0])
+			int mode = gGenMode ? HEADER_MODE_GEN : HEADER_MODE_SOLVE;
+			LogMsg("RECOVER", "Validating metadata: range=%d, dp=%d, mode=%d...", Range, DP, mode);
+			if (ValidateMeta(db.Header, Range, DP, mode, start_hex, pubkey_hex))
+			{
+				LogMsg("RECOVER", "ValidateMeta OK — metadata matches current task");
+
+				// Replay journal
+				char log_fn[1024];
+				MakeJournalName(gSaveFileName, log_fn, sizeof(log_fn));
+				LogMsg("RECOVER", "Replaying journal from %s...", log_fn);
+				ReplayJournalFile(log_fn, db);
+
+				// Restore state
+				PntTotalOps = *(u64*)(db.Header + HDR_OFF_OPS_DONE);
+				gOpsDone = PntTotalOps;
+				u64 saved_task_start = *(u64*)(db.Header + HDR_OFF_TASK_START);
+				gTaskStartTime = saved_task_start ? saved_task_start : GetTickCount64();
+
+				LogMsg("RECOVER", "State restored: ops_done=%llu, PntTotalOps=%llu, task_start_time=%llu",
+					gOpsDone, PntTotalOps, gTaskStartTime);
+
+				u64 cur_dps = db.GetBlockCnt();
+				double resume_progress = 0.0;
+				if (ops > 0)
+					resume_progress = 100.0 * (double)PntTotalOps / ops;
+				if (resume_progress > 100.0) resume_progress = 100.0;
+
+				LogMsg("RECOVER", "Resumed: %llu DPs (%.1f%% progress), ops_done=%llu, elapsed=%llus",
+					cur_dps, resume_progress, PntTotalOps,
+					gTaskStartTime ? (GetTickCount64() - gTaskStartTime) / 1000 : 0);
+
+				checkpoint_loaded = true;
+				// Skip tames loading if we already have data
+				gTamesFileName[0] = 0;
+			}
+			else
+			{
+				LogMsg("RECOVER", "ValidateMeta FAILED — metadata mismatch, starting fresh");
+				db.Clear();
+			}
+		}
+		else
+		{
+			LogMsg("RECOVER", "LoadFromFile FAILED for %s, starting fresh", gSaveFileName);
+		}
+	}
+	else if (!gNoSave && gSaveFileName[0])
+	{
+		LogMsg("RECOVER", "No checkpoint file %s found, starting fresh", gSaveFileName);
+	}
+
+	// Allocate journal buffer
+	if (!gNoSave && gSaveFileName[0])
+	{
+		gJournalBuf = (u8*)malloc(JOURNAL_BUF_SIZE);
+		if (gJournalBuf)
+			LogMsg("JOURNAL", "Buffer allocated: %d bytes (%d records max)",
+				JOURNAL_BUF_SIZE, (int)(JOURNAL_BUF_SIZE / JOURNAL_REC_LEN));
+		else
+			LogMsg("JOURNAL", "FATAL: failed to allocate journal buffer (%d bytes)!", JOURNAL_BUF_SIZE);
+		gJournalBufCnt = 0;
+		gLastFlushTime = GetTickCount64();
+		gLastCheckpointTime = GetTickCount64();
+	}
+
+	if (!gGenMode && gTamesFileName[0] && !checkpoint_loaded)
 	{
 		printf("load tames...\r\n");
 		if (db.LoadFromFile(gTamesFileName))
@@ -461,58 +760,127 @@ bool SolvePoint(EcPoint PntToSolve, int Range, int DP, EcInt* pk_res)
 	}
 
 	u64 tm_stats = GetTickCount64();
-	while (!gSolved)
-	{
-		CheckNewPoints();
-		Sleep(10);
-		if (GetTickCount64() - tm_stats > 10 * 1000)
+		while (!gSolved)
 		{
-			ShowStats(tm0, ops, dp_val);
-			tm_stats = GetTickCount64();
+			CheckNewPoints();
+			Sleep(10);
+
+			// Check for Ctrl+C / exit request
+			if (gExitRequested)
+			{
+				LogMsg("MAIN", "gExitRequested=true detected in main loop, breaking out");
+				break;
+			}
+
+			if (GetTickCount64() - tm_stats > 10 * 1000)
+			{
+				ShowStats(tm0, ops, dp_val);
+				tm_stats = GetTickCount64();
+			}
+
+			// Periodic journal flush
+			if (!gNoSave && gSaveFileName[0] && gJournalBufCnt > 0)
+			{
+				u64 now = GetTickCount64();
+				u64 journal_size = (u64)gJournalBufCnt * JOURNAL_REC_LEN;
+				u64 since_flush = (now - gLastFlushTime) / 1000;
+				u64 since_checkpoint = (now - gLastCheckpointTime) / 1000;
+
+				// Flush every gSaveSec seconds, or if journal buffer too large
+				if ((now - gLastFlushTime > (u64)gSaveSec * 1000) || (journal_size > JOURNAL_BUF_SIZE / 2))
+				{
+					LogMsg("MAIN", "Flush timer: since_flush=%llus (threshold=%ds), buf_size=%llu/%d, flushing",
+						since_flush, gSaveSec, journal_size, JOURNAL_BUF_SIZE);
+					FlushJournal();
+					gLastFlushTime = now;
+
+					// Full checkpoint every gCheckpointSec seconds, or if journal file too large
+					if ((now - gLastCheckpointTime > (u64)gCheckpointSec * 1000) || (journal_size > JOURNAL_MAX_SIZE))
+					{
+						LogMsg("MAIN", "Checkpoint timer: since_checkpoint=%llus (threshold=%ds), triggering full checkpoint",
+							since_checkpoint, gCheckpointSec);
+						DoFullCheckpoint();
+					}
+				}
+			}
+
+			if ((MaxTotalOps > 0.0) && ((PntTotalOps - gOpsDone) > (u64)MaxTotalOps))
+			{
+				gIsOpsLimit = true;
+				printf("Operations limit reached\r\n");
+				break;
+			}
 		}
 
-		if ((MaxTotalOps > 0.0) && (PntTotalOps > MaxTotalOps))
+		printf("Stopping work ...\r\n");
+		for (int i = 0; i < GpuCnt; i++)
+			GpuKangs[i]->Stop();
+		while (ThrCnt)
+			Sleep(10);
+		for (int i = 0; i < GpuCnt; i++)
 		{
-			gIsOpsLimit = true;
-			printf("Operations limit reached\r\n");
-			break;
-		}
-	}
-
-	printf("Stopping work ...\r\n");
-	for (int i = 0; i < GpuCnt; i++)
-		GpuKangs[i]->Stop();
-	while (ThrCnt)
-		Sleep(10);
-	for (int i = 0; i < GpuCnt; i++)
-	{
 #ifdef _WIN32
-		CloseHandle(thr_handles[i]);
+			CloseHandle(thr_handles[i]);
 #else
-		pthread_join(thr_handles[i], NULL);
+			pthread_join(thr_handles[i], NULL);
 #endif
-	}
-
-	if (gIsOpsLimit)
-	{
-		if (gGenMode)
-		{
-			printf("saving tames...\r\n");
-			db.Header[0] = gRange; 
-			if (db.SaveToFile(gTamesFileName))
-				printf("tames saved\r\n");
-			else
-				printf("tames saving failed\r\n");
 		}
-		db.Clear();
-		return false;
-	}
 
-	K = (double)PntTotalOps / pow(2.0, Range / 2.0);
-	printf("Point solved, K: %.3f (with DP and GPU overheads)\r\n\r\n", K);
-	db.Clear();
-	*pk_res = gPrivKey;
-	return true;
+		// Graceful shutdown: flush journal + full checkpoint
+		if (gExitRequested)
+		{
+			LogMsg("EXIT", "Graceful shutdown: gExitRequested=true, saving final checkpoint...");
+			DoFullCheckpoint();
+			// Free journal buffer
+			if (gJournalBuf) { free(gJournalBuf); LogMsg("EXIT", "Journal buffer freed"); gJournalBuf = NULL; }
+			db.Clear();
+			LogMsg("EXIT", "Graceful shutdown complete, returning false");
+			return false;
+		}
+
+		if (gIsOpsLimit)
+		{
+			LogMsg("EXIT", "Ops limit reached: PntTotalOps=%llu, gOpsDone=%llu, MaxTotalOps=%.0f",
+				PntTotalOps, gOpsDone, MaxTotalOps);
+			if (gGenMode)
+			{
+				printf("saving tames...\r\n");
+				db.Header[0] = gRange;
+				if (db.SaveToFile(gTamesFileName))
+					printf("tames saved\r\n");
+				else
+					printf("tames saving failed\r\n");
+			}
+			// Save checkpoint before clearing
+			DoFullCheckpoint();
+			if (gJournalBuf) { free(gJournalBuf); LogMsg("EXIT", "Journal buffer freed (ops limit)"); gJournalBuf = NULL; }
+			db.Clear();
+			return false;
+		}
+
+		K = (double)PntTotalOps / pow(2.0, Range / 2.0);
+		printf("Point solved, K: %.3f (with DP and GPU overheads)\r\n\r\n", K);
+
+		// Success! Delete checkpoint files (task completed)
+		if (!gNoSave && gSaveFileName[0])
+		{
+			char log_fn[1024], tmp_fn[1024];
+			MakeJournalName(gSaveFileName, log_fn, sizeof(log_fn));
+			MakeTmpName(gSaveFileName, tmp_fn, sizeof(tmp_fn));
+			LogMsg("EXIT", "Task solved! Cleaning checkpoint files: %s, %s, %s",
+				gSaveFileName, log_fn, tmp_fn);
+			int r1 = remove(gSaveFileName);
+			int r2 = remove(log_fn);
+			int r3 = remove(tmp_fn);
+			LogMsg("EXIT", "Checkpoint cleanup: .dat=%s, .log=%s, .tmp=%s",
+				r1 == 0 ? "deleted" : "not found/skip",
+				r2 == 0 ? "deleted" : "not found/skip",
+				r3 == 0 ? "deleted" : "not found/skip");
+		}
+		if (gJournalBuf) { free(gJournalBuf); LogMsg("EXIT", "Journal buffer freed (solved)"); gJournalBuf = NULL; }
+		db.Clear();
+		*pk_res = gPrivKey;
+		return true;
 }
 
 bool ParseCommandLine(int argc, char* argv[])
@@ -606,15 +974,121 @@ bool ParseCommandLine(int argc, char* argv[])
 			gMax = val;
 		}
 		else
+		if (strcmp(argument, "-save") == 0)
+		{
+			strcpy(gSaveFileName, argv[ci]);
+			ci++;
+			gNoSave = false;
+		}
+		else
+		if (strcmp(argument, "-nosave") == 0)
+		{
+			gNoSave = true;
+			gSaveFileName[0] = 0;
+		}
+		else
+		if (strcmp(argument, "-task") == 0)
+		{
+			gTaskId = atoi(argv[ci]);
+			ci++;
+			if (gTaskId <= 0)
+			{
+				printf("error: invalid value for -task option\r\n");
+				return false;
+			}
+		}
+		else
+		if (strcmp(argument, "-taskfile") == 0)
+		{
+			strcpy(gTaskFileName, argv[ci]);
+			ci++;
+		}
+		else
+		if (strcmp(argument, "-save_sec") == 0)
+		{
+			gSaveSec = atoi(argv[ci]);
+			ci++;
+			if (gSaveSec < 1)
+			{
+				printf("error: invalid value for -save_sec option\r\n");
+				return false;
+			}
+		}
+		else
+		if (strcmp(argument, "-checkpoint_sec") == 0)
+		{
+			gCheckpointSec = atoi(argv[ci]);
+			ci++;
+			if (gCheckpointSec < 1)
+			{
+				printf("error: invalid value for -checkpoint_sec option\r\n");
+				return false;
+			}
+		}
+		else
 		{
 			printf("error: unknown option %s\r\n", argument);
 			return false;
 		}
 	}
+
+	// Resolve task mapping if -task specified
+	if (gTaskId > 0)
+	{
+		const char* task_fn = gTaskFileName[0] ? gTaskFileName : DEFAULT_TASK_FILE;
+		LogMsg("PARSE", "Resolving task #%d from %s...", gTaskId, task_fn);
+		std::map<int, TaskMeta> tasks = LoadTaskMapping(task_fn);
+
+		if (tasks.empty())
+		{
+			LogMsg("PARSE", "ERROR: no tasks loaded from %s", task_fn);
+			printf("error: no tasks loaded from %s\r\n", task_fn);
+			return false;
+		}
+
+		auto it = tasks.find(gTaskId);
+		if (it == tasks.end())
+		{
+			LogMsg("PARSE", "ERROR: task id %d not found in %s (%d tasks available)",
+				gTaskId, task_fn, (int)tasks.size());
+			printf("error: task id %d not found in %s\r\n", gTaskId, task_fn);
+			return false;
+		}
+
+		TaskMeta& meta = it->second;
+
+		// Only fill from task mapping if not explicitly specified on command line
+		bool from_mapping = false;
+		if (!gRange)
+		{
+			gRange = meta.range;
+			from_mapping = true;
+		}
+		if (!gStartSet)
+		{
+			gStart.SetHexStr(meta.start_hex);
+			gStartSet = true;
+			from_mapping = true;
+		}
+		if (gPubKey.x.IsZero())
+		{
+			gPubKey.SetHexStr(meta.pubkey_hex);
+			from_mapping = true;
+		}
+
+		LogMsg("PARSE", "Task #%d resolved: range=%d, start_set=%s, pubkey_set=%s, from_mapping=%s",
+			gTaskId, gRange,
+			gStartSet ? "yes" : "no",
+			gPubKey.x.IsZero() ? "no" : "yes",
+			from_mapping ? "yes" : "no (cli overrides)");
+
+		printf("Task #%d: range=%d\r\n", gTaskId, gRange);
+	}
+
 	if (!gPubKey.x.IsZero())
 		if (!gStartSet || !gRange || !gDP)
 		{
-			printf("error: you must also specify -dp, -range and -start options\r\n");
+			printf("error: you must also specify -dp, -range and -start options (or use -task)\r\n");
 			return false;
 		}
 	if (gTamesFileName[0] && !IsFileExist(gTamesFileName))
@@ -662,8 +1136,47 @@ int main(int argc, char* argv[])
 	gGenMode = false;
 	gIsOpsLimit = false;
 	memset(gGPUs_Mask, 1, sizeof(gGPUs_Mask));
+
+	// Checkpoint defaults
+	gSaveFileName[0] = 0;
+	gTaskFileName[0] = 0;
+	gTaskId = 0;
+	gNoSave = false;
+	gSaveSec = DEFAULT_SAVE_SEC;
+	gCheckpointSec = DEFAULT_CHECKPOINT_SEC;
+	gOpsDone = 0;
+	gTaskStartTime = 0;
+	gExitRequested = false;
+	gJournalBuf = NULL;
+	gJournalBufCnt = 0;
+
 	if (!ParseCommandLine(argc, argv))
 		return 0;
+
+	// Apply defaults: -save defaults to task.dat if not specified and not -nosave
+	if (!gNoSave && !gSaveFileName[0])
+		strcpy(gSaveFileName, DEFAULT_SAVE_FILE);
+	// -dp defaults to 16
+	if (!gDP)
+		gDP = DEFAULT_DP;
+
+	LogMsg("INIT", "Config: save=%s, dp=%d, taskfile=%s, task_id=%d, nosave=%s, save_sec=%d, checkpoint_sec=%d",
+		gSaveFileName[0] ? gSaveFileName : "(none)",
+		gDP,
+		gTaskFileName[0] ? gTaskFileName : DEFAULT_TASK_FILE,
+		gTaskId,
+		gNoSave ? "yes" : "no",
+		gSaveSec, gCheckpointSec);
+
+	// Install signal handler for graceful shutdown
+#ifdef _WIN32
+	SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);
+	LogMsg("INIT", "Signal handler installed: SetConsoleCtrlHandler (Windows)");
+#else
+	signal(SIGINT, SigIntHandler);
+	signal(SIGTERM, SigIntHandler);
+	LogMsg("INIT", "Signal handler installed: SIGINT + SIGTERM (Linux)");
+#endif
 
 	InitGpus();
 
@@ -703,9 +1216,16 @@ int main(int argc, char* argv[])
 		gPubKey.y.GetHexStr(sy);
 		printf("Solving public key\r\nX: %s\r\nY: %s\r\n", sx, sy);
 		gStart.GetHexStr(sx);
-		printf("Offset: %s\r\n", sx);
+			printf("Offset: %s\r\n", sx);
 
-		if (!SolvePoint(PntToSolve, gRange, gDP, &pk_found))
+			// Set task start time for fresh starts (checkpoint recovery overrides this)
+			if (!gTaskStartTime)
+			{
+				gTaskStartTime = GetTickCount64();
+				LogMsg("INIT", "Fresh start: task_start_time=%llu (no checkpoint)", gTaskStartTime);
+			}
+
+			if (!SolvePoint(PntToSolve, gRange, gDP, &pk_found))
 		{
 			if (!gIsOpsLimit)
 				printf("FATAL ERROR: SolvePoint failed\r\n");

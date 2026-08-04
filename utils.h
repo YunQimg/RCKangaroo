@@ -9,6 +9,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <vector>
+#include <map>
 #include "defs.h"
 
 #ifdef _WIN32
@@ -70,6 +71,30 @@ struct TListRec
 };
 #pragma pack(pop)
 
+// Task mapping entry (from tasks.txt)
+struct TaskMeta
+{
+	int range;
+	char start_hex[64];
+	char pubkey_hex[130];
+};
+
+// Header format version for checkpoint .dat files
+#define HEADER_FORMAT_VERSION 1
+#define HEADER_MODE_SOLVE 0
+#define HEADER_MODE_GEN   1
+
+// Header metadata offsets (see checkpoint_design.md §4.1)
+#define HDR_OFF_RANGE         0
+#define HDR_OFF_DP            1
+#define HDR_OFF_MODE          2
+#define HDR_OFF_FORMAT_VER    3
+#define HDR_OFF_START_HEX     4
+#define HDR_OFF_PUBKEY_HEX    48
+#define HDR_OFF_OPS_DONE      160
+#define HDR_OFF_SAVED_TIME    168
+#define HDR_OFF_TASK_START    176
+
 class MemPool
 {
 private:
@@ -101,7 +126,24 @@ public:
 	u64 GetBlockCnt();
 	bool LoadFromFile(char* fn);
 	bool SaveToFile(char* fn);
+	// Extended save with metadata header (checkpoint_design.md §4.1)
+	bool SaveToFileEx(char* fn, int range, int dp, int mode, const char* start_hex, const char* pubkey_hex, u64 ops_done, u64 task_start_time);
 };
+
+// Validate checkpoint metadata against current task parameters
+bool ValidateMeta(u8* header, int range, int dp, int mode, const char* start_hex, const char* pubkey_hex);
+
+// Journal (WAL) file I/O — fixed-length 35-byte records
+bool AppendJournalFile(const char* fn, const u8* buf, int cnt);
+bool ReplayJournalFile(const char* fn, TFastBase& db);
+
+// Task mapping file parser
+std::map<int, TaskMeta> LoadTaskMapping(const char* fn);
 
 bool IsFileExist(char* fn);
 int GetExeDir(char* out_dir, int out_dir_size);
+
+// Helper: construct derived file names from save file name
+// e.g. "task.dat" -> "task.log" and "task.tmp"
+void MakeJournalName(const char* save_fn, char* out_journal, int out_size);
+void MakeTmpName(const char* save_fn, char* out_tmp, int out_size);
