@@ -1140,10 +1140,21 @@ bool ParseCommandLine(int argc, char* argv[])
 			from_mapping = true;
 		}
 		if (gPubKey.x.IsZero())
-		{
-			gPubKey.SetHexStr(meta.pubkey_hex);
-			from_mapping = true;
-		}
+			{
+				if (!gPubKey.SetHexStr(meta.pubkey_hex))
+				{
+					char pubkey_preview[24] = { 0 };
+					strncpy(pubkey_preview, meta.pubkey_hex, 20);
+					pubkey_preview[20] = '\0';
+					LogMsg("PARSE", "ERROR: SetHexStr failed for pubkey from task mapping: %s... (len=%d)",
+						pubkey_preview, (int)strlen(meta.pubkey_hex));
+					printf("error: invalid pubkey for task #%d in %s\r\n", gTaskId, task_fn);
+					printf("  pubkey: %s...\r\n", pubkey_preview);
+					printf("  Expected: 66-char compressed (02/03 prefix) or 130-char uncompressed (04 prefix)\r\n");
+					return false;
+				}
+				from_mapping = true;
+			}
 
 		LogMsg("PARSE", "Task #%d resolved: range=%d, start_set=%s, pubkey_set=%s, from_mapping=%s",
 			gTaskId, gRange,
