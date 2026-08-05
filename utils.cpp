@@ -604,13 +604,12 @@ std::map<int, TaskMeta> LoadTaskMapping(const char* fn)
 			continue;
 
 		int id, range;
-		char start_hex[64] = { 0 };
 		char pubkey_hex[130] = { 0 };
 
-		int n = sscanf(line, "%d %d %63s %129s", &id, &range, start_hex, pubkey_hex);
-		if (n < 4)
+		int n = sscanf(line, "%d %d %66s", &id, &range, pubkey_hex);
+		if (n < 3)
 		{
-			printf("LoadTaskMapping: line %d: invalid format (expected 4 fields), skipping\r\n", line_no);
+			printf("LoadTaskMapping: line %d: invalid format (expected 3 fields), skipping\r\n", line_no);
 			continue;
 		}
 
@@ -629,6 +628,15 @@ std::map<int, TaskMeta> LoadTaskMapping(const char* fn)
 		// Check for duplicate id (warn and overwrite)
 		if (result.find(id) != result.end())
 			printf("LoadTaskMapping: duplicate id %d on line %d, overwriting previous\r\n", id, line_no);
+
+		// Compute start_hex = 2^range as 64-char hex string (auto-generated)
+		char start_hex[65];
+		memset(start_hex, '0', 64);
+		start_hex[64] = '\0';
+		int shift = range % 4;
+		int hex_digit_val = 1 << shift;
+		int pos = 64 - (range / 4) - 1;
+		start_hex[pos] = (hex_digit_val < 10) ? ('0' + hex_digit_val) : ('A' + hex_digit_val - 10);
 
 		TaskMeta meta;
 			meta.range = range;

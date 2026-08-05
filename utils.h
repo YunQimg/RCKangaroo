@@ -75,7 +75,7 @@ struct TListRec
 struct TaskMeta
 {
 	int range;
-	char start_hex[64];
+	char start_hex[65];
 	char pubkey_hex[130];
 };
 

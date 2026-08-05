@@ -1067,9 +1067,9 @@ void ShowHelp()
 	printf("  # Benchmark (no pubkey = benchmark mode)\r\n");
 	printf("  rckangaroo -range 84 -dp 16\r\n\r\n");
 	printf("TASK FILE FORMAT (tasks.txt):\r\n");
-	printf("  # <id> <range> <start_hex> <pubkey_hex>\r\n");
-	printf("  1  84  0000...0001  04ABCD...\r\n");
-	printf("  2  88  0000...0002  04EF01...\r\n");
+	printf("  # <id> <range> <pubkey_hex>\r\n");
+	printf("  # start_hex = 2^range (auto-computed, 64 hex chars)\r\n");
+	printf("  1  84  0329C4574A4FD8C810B7E42A4B398882B381BCD85E40C6883712912D167C83E73A\r\n");
 }
 
 bool ParseCommandLine(int argc, char* argv[])
