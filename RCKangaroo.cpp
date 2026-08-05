@@ -517,7 +517,7 @@ void ShowStats(u64 tm_start, double exp_ops, double dp_val)
 	int eta_m = (int)((eta_sec % 3600) / 60);
 
 	// Build progress bar (20 chars)
-	char bar[21] = "[                    ]";
+	char bar[23] = "[                    ]";
 	int bar_fill = (int)(progress / 5.0);
 	if (bar_fill > 20) bar_fill = 20;
 	for (int b = 0; b < bar_fill; b++) bar[b + 1] = '#';
