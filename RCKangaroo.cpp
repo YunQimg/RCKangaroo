@@ -894,6 +894,133 @@ bool SolvePoint(EcPoint PntToSolve, int Range, int DP, EcInt* pk_res)
 }
 
 // ============================================================================
+// Task file validation — check pubkey format and curve validity
+// ============================================================================
+
+// Check if a character is a valid hex digit
+static bool IsHexChar(char c)
+{
+	return ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f'));
+}
+
+// Validate a single pubkey hex string with detailed diagnostics
+// Returns true if valid, false if invalid (with diag populated)
+static bool ValidatePubkey(const char* pubkey_hex, char* diag, int diag_size)
+{
+	int len = (int)strlen(pubkey_hex);
+
+	// 1) Empty
+	if (len == 0)
+	{
+		snprintf(diag, diag_size, "pubkey is empty");
+		return false;
+	}
+
+	// 2) Check every character is valid hex
+	for (int i = 0; i < len; i++)
+	{
+		if (!IsHexChar(pubkey_hex[i]))
+		{
+			snprintf(diag, diag_size,
+				"invalid hex char '\\x%02X' at position %d (len=%d)",
+				(u8)pubkey_hex[i], i, len);
+			return false;
+		}
+	}
+
+	// 3) Check prefix
+	char pfx[3] = { (char)toupper(pubkey_hex[0]), (char)toupper(pubkey_hex[1]), '\0' };
+	if (strcmp(pfx, "02") != 0 && strcmp(pfx, "03") != 0 && strcmp(pfx, "04") != 0)
+	{
+		// Try to show what the first byte actually is
+		int first_byte = 0;
+		sscanf(pubkey_hex, "%2x", &first_byte);
+		snprintf(diag, diag_size,
+			"invalid prefix 0x%02X (len=%d) — expected 02, 03 (compressed), or 04 (uncompressed)",
+			first_byte, len);
+		return false;
+	}
+
+	// 4) Length check
+	if (strcmp(pfx, "04") == 0)
+	{
+		if (len != 130)
+		{
+			snprintf(diag, diag_size,
+				"uncompressed pubkey (04 prefix) must be 130 chars, got %d chars", len);
+			return false;
+		}
+	}
+	else // 02 or 03
+	{
+		if (len != 66)
+		{
+			snprintf(diag, diag_size,
+				"compressed pubkey (%s prefix) must be 66 chars, got %d chars", pfx, len);
+			return false;
+		}
+	}
+
+	// 5) Curve point validity — try SetHexStr
+	EcPoint test_pt;
+	if (!test_pt.SetHexStr(pubkey_hex))
+	{
+		snprintf(diag, diag_size,
+			"pubkey is not a valid secp256k1 curve point (y^2 != x^3+7 mod P or CalcY failed)");
+		return false;
+	}
+
+	return true;
+}
+
+// Validate all tasks in the mapping file and print diagnostic report
+static int ValidateTaskFile(const char* task_fn)
+{
+	std::map<int, TaskMeta> tasks = LoadTaskMapping(task_fn);
+	if (tasks.empty())
+	{
+		LogMsg("PARSE", "ValidateTaskFile: no tasks loaded from %s", task_fn);
+		printf("  [WARN] No tasks loaded from %s\r\n", task_fn);
+		return 0;
+	}
+
+	printf("  Validating %d task(s) from %s:\r\n", (int)tasks.size(), task_fn);
+	LogMsg("PARSE", "ValidateTaskFile: checking %d task(s) from %s", (int)tasks.size(), task_fn);
+
+	int ok = 0, bad = 0;
+	for (auto& kv : tasks)
+	{
+		int id = kv.first;
+		TaskMeta& meta = kv.second;
+		char diag[256] = { 0 };
+
+		if (ValidatePubkey(meta.pubkey_hex, diag, sizeof(diag)))
+		{
+			printf("    Task #%d: pubkey OK (len=%d, prefix=%c%c, range=%d)\r\n",
+				id, (int)strlen(meta.pubkey_hex),
+				toupper(meta.pubkey_hex[0]), toupper(meta.pubkey_hex[1]),
+				meta.range);
+			LogMsg("PARSE", "  Task #%d: pubkey OK (len=%d, range=%d)",
+				id, (int)strlen(meta.pubkey_hex), meta.range);
+			ok++;
+		}
+		else
+		{
+			printf("    Task #%d: pubkey INVALID — %s\r\n", id, diag);
+			printf("      pubkey[%d]: %s\r\n", (int)strlen(meta.pubkey_hex), meta.pubkey_hex);
+			LogMsg("PARSE", "  Task #%d: pubkey INVALID — %s (pubkey=%s)",
+				id, diag, meta.pubkey_hex);
+			bad++;
+		}
+	}
+
+	printf("  Result: %d valid, %d invalid, %d total\r\n", ok, bad, (int)tasks.size());
+	LogMsg("PARSE", "ValidateTaskFile: done — %d valid, %d invalid, %d total",
+		ok, bad, (int)tasks.size());
+	return ok;
+}
+
+// ============================================================================
 // Help / usage text
 // ============================================================================
 void ShowHelp()
@@ -901,15 +1028,15 @@ void ShowHelp()
 	printf("RCKangaroo v4.0 — GPU-accelerated ECDLP solver (Pollard's kangaroo, SOTA v2)\r\n");
 	printf("https://github.com/RetiredC\r\n\r\n");
 	printf("USAGE:\r\n");
-	printf("  RCKangaroo.exe [options]\r\n\r\n");
+	printf("  rckangaroo [options]\r\n\r\n");
 	printf("QUICK START (using task mapping):\r\n");
-	printf("  RCKangaroo.exe -task <id>               Solve task by id from tasks.txt\r\n");
-	printf("  RCKangaroo.exe -task <id> -tames X.dat   With pre-generated tame points\r\n\r\n");
+	printf("  rckangaroo -task <id>               Solve task by id from tasks.txt\r\n");
+	printf("  rckangaroo -task <id> -tames X.dat   With pre-generated tame points\r\n\r\n");
 	printf("MANUAL MODE:\r\n");
-	printf("  RCKangaroo.exe -range <N> -start <hex> -pubkey <hex>\r\n");
-	printf("  RCKangaroo.exe -range <N> -start <hex> -pubkey <hex> -tames X.dat\r\n\r\n");
+	printf("  rckangaroo -range <N> -start <hex> -pubkey <hex>\r\n");
+	printf("  rckangaroo -range <N> -start <hex> -pubkey <hex> -tames X.dat\r\n\r\n");
 	printf("TAMES GENERATION:\r\n");
-	printf("  RCKangaroo.exe -range <N> -tames X.dat -max <N>\r\n\r\n");
+	printf("  rckangaroo -range <N> -tames X.dat -max <N>\r\n\r\n");
 	printf("OPTIONS:\r\n");
 	printf("  -range <32..170>      Bit range of the private key (required)\r\n");
 	printf("  -start <hex>           Start offset (64-char hex, required)\r\n");
@@ -928,17 +1055,17 @@ void ShowHelp()
 	printf("  -checkpoint_sec <N>    Full checkpoint interval in seconds (default: %d)\r\n\r\n", DEFAULT_CHECKPOINT_SEC);
 	printf("EXAMPLES:\r\n");
 	printf("  # Solve puzzle #1 from tasks.txt with auto-save\r\n");
-	printf("  RCKangaroo.exe -task 1\r\n\r\n");
+	printf("  rckangaroo -task 1\r\n\r\n");
 	printf("  # Solve puzzle #1 with custom save file and tame points\r\n");
-	printf("  RCKangaroo.exe -task 1 -save mytask.dat -tames tames84.dat\r\n\r\n");
+	printf("  rckangaroo -task 1 -save mytask.dat -tames tames84.dat\r\n\r\n");
 	printf("  # Solve manually (no task mapping)\r\n");
-	printf("  RCKangaroo.exe -range 84 -start 0000...0001 -pubkey 04ABCD...\r\n\r\n");
+	printf("  rckangaroo -range 84 -start 0000...0001 -pubkey 04ABCD...\r\n\r\n");
 	printf("  # Generate tame points\r\n");
-	printf("  RCKangaroo.exe -range 84 -tames tames84.dat -max 10\r\n\r\n");
+	printf("  rckangaroo -range 84 -tames tames84.dat -max 10\r\n\r\n");
 	printf("  # Resume interrupted task\r\n");
-	printf("  RCKangaroo.exe -task 1\r\n\r\n");
+	printf("  rckangaroo -task 1\r\n\r\n");
 	printf("  # Benchmark (no pubkey = benchmark mode)\r\n");
-	printf("  RCKangaroo.exe -range 84 -dp 16\r\n\r\n");
+	printf("  rckangaroo -range 84 -dp 16\r\n\r\n");
 	printf("TASK FILE FORMAT (tasks.txt):\r\n");
 	printf("  # <id> <range> <start_hex> <pubkey_hex>\r\n");
 	printf("  1  84  0000...0001  04ABCD...\r\n");
@@ -1103,19 +1230,50 @@ bool ParseCommandLine(int argc, char* argv[])
 
 	// Resolve task mapping if -task specified
 	if (gTaskId > 0)
-	{
-		const char* task_fn = gTaskFileName[0] ? gTaskFileName : DEFAULT_TASK_FILE;
-		LogMsg("PARSE", "Resolving task #%d from %s...", gTaskId, task_fn);
-		std::map<int, TaskMeta> tasks = LoadTaskMapping(task_fn);
-
-		if (tasks.empty())
 		{
-			LogMsg("PARSE", "ERROR: no tasks loaded from %s", task_fn);
-			printf("error: no tasks loaded from %s\r\n", task_fn);
-			return false;
-		}
+			const char* task_fn = gTaskFileName[0] ? gTaskFileName : DEFAULT_TASK_FILE;
+			LogMsg("PARSE", "Resolving task #%d from %s...", gTaskId, task_fn);
+			std::map<int, TaskMeta> tasks = LoadTaskMapping(task_fn);
 
-		auto it = tasks.find(gTaskId);
+			if (tasks.empty())
+			{
+				LogMsg("PARSE", "ERROR: no tasks loaded from %s", task_fn);
+				printf("error: no tasks loaded from %s\r\n", task_fn);
+				return false;
+			}
+
+			// Validate all tasks in the file with detailed diagnostics
+			printf("  Validating %d task(s) from %s:\r\n", (int)tasks.size(), task_fn);
+			LogMsg("PARSE", "Validating %d task(s) from %s:", (int)tasks.size(), task_fn);
+			int n_ok = 0, n_bad = 0;
+			for (auto& kv : tasks)
+			{
+				int tid = kv.first;
+				TaskMeta& tm = kv.second;
+				char diag[256] = { 0 };
+
+				if (ValidatePubkey(tm.pubkey_hex, diag, sizeof(diag)))
+				{
+					printf("    Task #%d: pubkey OK (len=%d, prefix=%c%c, range=%d)\r\n",
+						tid, (int)strlen(tm.pubkey_hex),
+						toupper(tm.pubkey_hex[0]), toupper(tm.pubkey_hex[1]),
+						tm.range);
+					LogMsg("PARSE", "  Task #%d: pubkey OK (len=%d, range=%d)",
+						tid, (int)strlen(tm.pubkey_hex), tm.range);
+					n_ok++;
+				}
+				else
+				{
+					printf("    Task #%d: pubkey INVALID — %s\r\n", tid, diag);
+					printf("      pubkey: %s\r\n", tm.pubkey_hex);
+					LogMsg("PARSE", "  Task #%d: pubkey INVALID — %s", tid, diag);
+					n_bad++;
+				}
+			}
+			printf("  Result: %d valid, %d invalid, %d total\r\n", n_ok, n_bad, (int)tasks.size());
+			LogMsg("PARSE", "Task validation done: %d ok, %d bad, %d total", n_ok, n_bad, (int)tasks.size());
+
+			auto it = tasks.find(gTaskId);
 		if (it == tasks.end())
 		{
 			LogMsg("PARSE", "ERROR: task id %d not found in %s (%d tasks available)",
