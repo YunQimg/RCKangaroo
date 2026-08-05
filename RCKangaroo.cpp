@@ -831,6 +831,15 @@ bool SolvePoint(EcPoint PntToSolve, int Range, int DP, EcInt* pk_res)
 		if (gExitRequested)
 		{
 			LogMsg("EXIT", "Graceful shutdown: gExitRequested=true, saving final checkpoint...");
+			if (gGenMode && gTamesFileName[0])
+			{
+				printf("saving tames before exit...\r\n");
+				db.Header[0] = gRange;
+				if (db.SaveToFile(gTamesFileName))
+					printf("tames saved to %s\r\n", gTamesFileName);
+				else
+					printf("tames saving failed\r\n");
+			}
 			DoFullCheckpoint();
 			// Free journal buffer
 			if (gJournalBuf) { free(gJournalBuf); LogMsg("EXIT", "Journal buffer freed"); gJournalBuf = NULL; }
