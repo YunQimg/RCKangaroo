@@ -179,13 +179,14 @@ void DoFullCheckpoint()
 	MakeJournalName(gSaveFileName, log_fn, sizeof(log_fn));
 
 	// Get start/pk hex strings for metadata
+	// pubkey x/y are 256-bit = 64 hex chars each, so 65-byte buffers are safe
 	char start_hex[44] = { 0 };
-	char pubkey_hex[112] = { 0 };
+	char pubkey_hex[131] = { 0 }; // 64+64+null+padding
 	if (gStartSet)
 		gStart.GetHexStr(start_hex);
 	if (!gPubKey.x.IsZero())
 	{
-		char sx[100], sy[100];
+		char sx[65] = { 0 }, sy[65] = { 0 };
 		gPubKey.x.GetHexStr(sx);
 		gPubKey.y.GetHexStr(sy);
 		snprintf(pubkey_hex, sizeof(pubkey_hex), "%s%s", sx, sy);
@@ -592,12 +593,12 @@ bool SolvePoint(EcPoint PntToSolve, int Range, int DP, EcInt* pk_res)
 
 			// Get hex strings for validation
 			char start_hex[44] = { 0 };
-			char pubkey_hex[112] = { 0 };
+			char pubkey_hex[131] = { 0 }; // 64+64+null+padding
 			if (gStartSet)
 				gStart.GetHexStr(start_hex);
 			if (!gPubKey.x.IsZero())
 			{
-				char sx[100], sy[100];
+				char sx[65] = { 0 }, sy[65] = { 0 };
 				gPubKey.x.GetHexStr(sx);
 				gPubKey.y.GetHexStr(sy);
 				snprintf(pubkey_hex, sizeof(pubkey_hex), "%s%s", sx, sy);
@@ -747,7 +748,7 @@ bool SolvePoint(EcPoint PntToSolve, int Range, int DP, EcInt* pk_res)
 	pthread_t thr_handles[MAX_GPU_CNT];
 #endif
 
-	u32 ThreadID;
+	u32 ThreadID = 0;
 	gSolved = false;
 	ThrCnt = GpuCnt;
 	for (int i = 0; i < GpuCnt; i++)

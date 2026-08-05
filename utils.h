@@ -140,7 +140,7 @@ bool ReplayJournalFile(const char* fn, TFastBase& db);
 // Task mapping file parser
 std::map<int, TaskMeta> LoadTaskMapping(const char* fn);
 
-bool IsFileExist(char* fn);
+bool IsFileExist(const char* fn);
 int GetExeDir(char* out_dir, int out_dir_size);
 
 // Helper: construct derived file names from save file name

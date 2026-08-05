@@ -199,7 +199,6 @@ u8* TFastBase::AddDataBlock(u8* data, int pos)
 
 u8* TFastBase::FindDataBlock(u8* data)
 {
-	bool res = false;
 	TListRec* list = &lists[data[0]][data[1]][data[2]];
 	int first = lower_bound(list, data[0], data + 3);
 	if (first == list->cnt)
@@ -302,7 +301,7 @@ bool TFastBase::SaveToFile(char* fn)
 	return true;
 }
 
-bool IsFileExist(char* fn)
+bool IsFileExist(const char* fn)
 {
 	FILE* fp = fopen(fn, "rb");
 	if (!fp)
@@ -632,10 +631,12 @@ std::map<int, TaskMeta> LoadTaskMapping(const char* fn)
 			printf("LoadTaskMapping: duplicate id %d on line %d, overwriting previous\r\n", id, line_no);
 
 		TaskMeta meta;
-		meta.range = range;
-		strncpy(meta.start_hex, start_hex, 63);
-		strncpy(meta.pubkey_hex, pubkey_hex, 129);
-		result[id] = meta;
+			meta.range = range;
+			strncpy(meta.start_hex, start_hex, sizeof(meta.start_hex) - 1);
+			meta.start_hex[sizeof(meta.start_hex) - 1] = '\0';
+			strncpy(meta.pubkey_hex, pubkey_hex, sizeof(meta.pubkey_hex) - 1);
+			meta.pubkey_hex[sizeof(meta.pubkey_hex) - 1] = '\0';
+			result[id] = meta;
 	}
 
 	fclose(fp);
