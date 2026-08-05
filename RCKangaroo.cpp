@@ -883,6 +883,58 @@ bool SolvePoint(EcPoint PntToSolve, int Range, int DP, EcInt* pk_res)
 		return true;
 }
 
+// ============================================================================
+// Help / usage text
+// ============================================================================
+void ShowHelp()
+{
+	printf("RCKangaroo v4.0 — GPU-accelerated ECDLP solver (Pollard's kangaroo, SOTA v2)\r\n");
+	printf("https://github.com/RetiredC\r\n\r\n");
+	printf("USAGE:\r\n");
+	printf("  RCKangaroo.exe [options]\r\n\r\n");
+	printf("QUICK START (using task mapping):\r\n");
+	printf("  RCKangaroo.exe -task <id>               Solve task by id from tasks.txt\r\n");
+	printf("  RCKangaroo.exe -task <id> -tames X.dat   With pre-generated tame points\r\n\r\n");
+	printf("MANUAL MODE:\r\n");
+	printf("  RCKangaroo.exe -range <N> -start <hex> -pubkey <hex>\r\n");
+	printf("  RCKangaroo.exe -range <N> -start <hex> -pubkey <hex> -tames X.dat\r\n\r\n");
+	printf("TAMES GENERATION:\r\n");
+	printf("  RCKangaroo.exe -range <N> -tames X.dat -max <N>\r\n\r\n");
+	printf("OPTIONS:\r\n");
+	printf("  -range <32..170>      Bit range of the private key (required)\r\n");
+	printf("  -start <hex>           Start offset (64-char hex, required)\r\n");
+	printf("  -pubkey <hex>          Public key (130-char hex with 04 prefix)\r\n");
+	printf("  -dp <14..60>           Distinguished point bits (default: %d)\r\n", DEFAULT_DP);
+	printf("  -tames <file>          Tame points file (load or generate)\r\n");
+	printf("  -max <N>               Max ops multiplier (e.g. 10 = 10x expected)\r\n");
+	printf("  -gpu <digits>          GPU mask, e.g. -gpu 0 or -gpu 01 (default: all)\r\n\r\n");
+	printf("TASK MAPPING:\r\n");
+	printf("  -task <id>             Task id from tasks.txt (default: %s)\r\n", DEFAULT_TASK_FILE);
+	printf("  -taskfile <path>       Custom task mapping file path\r\n\r\n");
+	printf("CHECKPOINT (auto-save & resume):\r\n");
+	printf("  -save <file>           Save file name (default: %s, auto-enabled)\r\n", DEFAULT_SAVE_FILE);
+	printf("  -nosave                Disable checkpoint/resume\r\n");
+	printf("  -save_sec <N>          Journal flush interval in seconds (default: %d)\r\n", DEFAULT_SAVE_SEC);
+	printf("  -checkpoint_sec <N>    Full checkpoint interval in seconds (default: %d)\r\n\r\n", DEFAULT_CHECKPOINT_SEC);
+	printf("EXAMPLES:\r\n");
+	printf("  # Solve puzzle #1 from tasks.txt with auto-save\r\n");
+	printf("  RCKangaroo.exe -task 1\r\n\r\n");
+	printf("  # Solve puzzle #1 with custom save file and tame points\r\n");
+	printf("  RCKangaroo.exe -task 1 -save mytask.dat -tames tames84.dat\r\n\r\n");
+	printf("  # Solve manually (no task mapping)\r\n");
+	printf("  RCKangaroo.exe -range 84 -start 0000...0001 -pubkey 04ABCD...\r\n\r\n");
+	printf("  # Generate tame points\r\n");
+	printf("  RCKangaroo.exe -range 84 -tames tames84.dat -max 10\r\n\r\n");
+	printf("  # Resume interrupted task\r\n");
+	printf("  RCKangaroo.exe -task 1\r\n\r\n");
+	printf("  # Benchmark (no pubkey = benchmark mode)\r\n");
+	printf("  RCKangaroo.exe -range 84 -dp 16\r\n\r\n");
+	printf("TASK FILE FORMAT (tasks.txt):\r\n");
+	printf("  # <id> <range> <start_hex> <pubkey_hex>\r\n");
+	printf("  1  84  0000...0001  04ABCD...\r\n");
+	printf("  2  88  0000...0002  04EF01...\r\n");
+}
+
 bool ParseCommandLine(int argc, char* argv[])
 {
 	int ci = 1;
@@ -890,6 +942,13 @@ bool ParseCommandLine(int argc, char* argv[])
 	{
 		char* argument = argv[ci];
 		ci++;
+		if (strcmp(argument, "-help") == 0 || strcmp(argument, "-h") == 0 ||
+			strcmp(argument, "--help") == 0 || strcmp(argument, "-?") == 0)
+		{
+			ShowHelp();
+			return false;
+		}
+		else
 		if (strcmp(argument, "-gpu") == 0)
 		{
 			if (ci >= argc)
@@ -1153,6 +1212,14 @@ int main(int argc, char* argv[])
 	if (!ParseCommandLine(argc, argv))
 		return 0;
 
+	// Show help if no arguments — ParseCommandLine already returned false for -help,
+	// but also handle the case of no args at all (argc == 1)
+	if (argc == 1)
+	{
+		ShowHelp();
+		return 0;
+	}
+
 	// Apply defaults: -save defaults to task.dat if not specified and not -nosave
 	if (!gNoSave && !gSaveFileName[0])
 		strcpy(gSaveFileName, DEFAULT_SAVE_FILE);
@@ -1184,6 +1251,40 @@ int main(int argc, char* argv[])
 	{
 		printf("No supported GPUs detected, exit\r\n");
 		return 0;
+	}
+
+	// Verify required cubin files exist before attempting GPU prepare
+	{
+		bool sm89_needed = false;
+		bool sm120_needed = false;
+		for (int i = 0; i < GpuCnt; i++)
+		{
+			if (GpuKangs[i]->Is5xxx)
+				sm120_needed = true;
+			else
+				sm89_needed = true;
+		}
+
+		if (sm89_needed)
+		{
+			if (!IsFileExist("kernel_sm89.cubin"))
+			{
+				printf("FATAL: kernel_sm89.cubin not found in current directory\r\n");
+				printf("  Please ensure the cubin file is in the same directory as the executable.\r\n");
+				return 0;
+			}
+			LogMsg("INIT", "cubin check: kernel_sm89.cubin found");
+		}
+		if (sm120_needed)
+		{
+			if (!IsFileExist("kernel_sm120.cubin"))
+			{
+				printf("FATAL: kernel_sm120.cubin not found in current directory\r\n");
+				printf("  Please ensure the cubin file is in the same directory as the executable.\r\n");
+				return 0;
+			}
+			LogMsg("INIT", "cubin check: kernel_sm120.cubin found");
+		}
 	}
 
 	pPntList = (u8*)malloc(MAX_CNT_LIST * GPU_DP_SIZE);
